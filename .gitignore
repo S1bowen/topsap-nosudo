@@ -1,0 +1,21 @@
+# credentials -- never commit
+.pwd
+keys/
+topsap.env
+
+# runtime state
+run/
+req/
+*.log
+*.strace
+__pycache__/
+*.pyc
+
+# build output (setup.sh compiles these from src/ and dev/)
+bin/svctl
+bin/svdbg
+bin/slirp4netns
+lib/
+
+# packaging
+topsap-*-portable.tar.gz
