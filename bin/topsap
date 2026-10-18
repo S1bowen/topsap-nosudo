@@ -1,0 +1,656 @@
+#!/bin/bash
+# topsap - zero-privilege TopSAP SSL-VPN driver
+# Runs the TopSAP engine inside a private user+net+mount+ipc namespace with
+# user-mode networking (slirp4netns). No sudo, no root, host untouched.
+ROOT=${TOPSAP_ROOT:-$HOME/topsap}
+BIN=$ROOT/bin; ENGINE=$ROOT/engine; STATE=$ROOT/state; RUN=$ROOT/run
+SLIRP=$BIN/slirp4netns
+CTL=$RUN/ctl.sock; TMUX=$RUN/tmux.sock
+# Port this machine's proxy is published on, on the far side.  It must match
+# the RemoteForward port of the ~/.ssh/config host named by TOPSAP_PROXY_TARGET.
+PXPORT=${TOPSAP_PROXY_PORT:-18438}
+
+msg(){ printf '%s\n' "$*"; }
+die(){ printf 'topsap: %s\n' "$*" >&2; exit 1; }
+pget(){ [ -s "$1" ] && cat "$1" || true; }
+alive(){ local p; p=$(pget "$1"); [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+
+usage(){ cat <<'EOT'
+topsap - zero-privilege TopSAP SSL-VPN client
+
+  topsap up            start sandbox: namespaces + slirp + engine
+  topsap down          stop everything
+  topsap status        show state
+  topsap shell         interactive shell INSIDE the tunnel (tmux)
+  topsap ssh [ARGS]    ssh inside the tunnel (uses the synced ssh config)
+  topsap windows       list the tmux windows the sandbox is running
+  topsap run CMD       run one command inside the tunnel
+  topsap login H P U   log in to the VPN gateway (password: 4th arg / TOPSAP_PWD / prompt)
+  topsap vpn           query tunnel status
+  topsap proxy [up|down|status]
+                       hold this machine's LAN proxy open on the remote side,
+                       as 127.0.0.1:18438 on the TOPSAP_PROXY_TARGET alias
+  topsap pxcheck       check that proxy from the remote side
+  topsap fwd LPORT [ALIAS:]HOST[:PORT] [BIND]
+                       bring a far-side port to THIS machine, e.g.
+                       topsap fwd 9000 10.0.0.4:8888      -> http://127.0.0.1:9000
+                       topsap fwd 2222 vpn-login:22       -> ssh -p 2222 127.0.0.1
+                       a name from ~/.ssh/config may be used; if it needs a
+                       ProxyCommand (e.g. vpn-remote) the dial goes through that
+                       connection, so every connection logs in to the jump host
+                       and needs ~17s before its first byte:
+                       topsap fwd 2222 vpn-remote:22
+  topsap fwd ls        list the forwards
+  topsap fwd check N   make a real connection through forward N
+  topsap fwd rm LPORT  stop one (or: all)
+  topsap logout        log out
+  topsap raw JSON      send an arbitrary engine command
+  topsap log [N]       tail the engine log
+  topsap probe         connectivity checks inside the tunnel
+EOT
+}
+
+cmd_up(){
+  cmd_down >/dev/null 2>&1 || true
+  rm -rf "$RUN"; mkdir -p "$RUN" "$STATE"
+  : > "$RUN/sandbox.log"
+  [ -f /etc/hosts ] && cp -f /etc/hosts "$STATE/hosts" || printf '127.0.0.1 localhost\n' > "$STATE/hosts"
+  printf 'nameserver 10.0.2.3\n' > "$STATE/resolv.conf"
+  rm -f "$RUN/ready" "$RUN/slirp.ok" "$RUN/ns.pid"
+
+  setsid unshare -Urnm -i -- "$BIN/sandbox.sh" >>"$RUN/sandbox.log" 2>&1 </dev/null &
+  echo $! > "$RUN/unshare.pid"
+
+  local i pid
+  for i in $(seq 1 120); do [ -s "$RUN/ns.pid" ] && break; sleep 0.1; done
+  pid=$(pget "$RUN/ns.pid")
+  [ -n "$pid" ] || { msg "namespace failed to start:"; cat "$RUN/sandbox.log"; return 1; }
+  msg "netns pid $pid"
+
+  LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    setsid nohup "$SLIRP" --configure -m 65520 "$pid" tap0 >"$RUN/slirp.log" 2>&1 </dev/null &
+  echo $! > "$RUN/slirp.pid"
+  sleep 2
+  touch "$RUN/slirp.ok"
+
+  for i in $(seq 1 300); do [ -e "$RUN/ready" ] && break; sleep 0.1; done
+  if [ ! -e "$RUN/ready" ]; then
+    msg "sandbox did not become ready; log:"; tail -n 30 "$RUN/sandbox.log"; return 1
+  fi
+  msg "sandbox ready"
+  cmd_status
+}
+
+cmd_down(){
+  local p f
+  # Only ever signal processes this run recorded; never touch other processes.
+  # Forwards are half out here and half inside the sandbox, so both halves go.
+  for f in "$FWDIR"/*.cfg; do [ -e "$f" ] || continue; fwd_stop "$(basename "$f" .cfg)"; done
+  p=$(pget "$RUN/engine.pid");  [ -n "$p" ] && kill -TERM "$p"     2>/dev/null
+  p=$(pget "$RUN/ns.pid");      [ -n "$p" ] && kill -TERM "$p"     2>/dev/null
+  p=$(pget "$RUN/unshare.pid"); [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null
+  p=$(pget "$RUN/slirp.pid");   [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null
+  p=$(pget "$RUN/proxy.pid");   [ -n "$p" ] && kill -TERM "$p"     2>/dev/null
+  tmux -S "$TMUX" kill-server 2>/dev/null
+  sleep 1
+  rm -f "$RUN/ready" "$RUN/ns.pid" "$RUN/engine.pid"
+  msg "stopped"
+}
+
+cmd_status(){
+  local pid
+  if alive "$RUN/ns.pid"; then msg "sandbox : up (netns pid $(pget "$RUN/ns.pid"))"; else msg "sandbox : down"; fi
+  if alive "$RUN/slirp.pid"; then msg "slirp   : up (pid $(pget "$RUN/slirp.pid"))"; else msg "slirp   : down"; fi
+  if alive "$RUN/engine.pid"; then msg "engine  : up (pid $(pget "$RUN/engine.pid"))"; else msg "engine  : down"; fi
+  if grep -qi topsec "$( [ -s "$RUN/engine.pid" ] && echo /proc/$(pget "$RUN/engine.pid")/maps )" 2>/dev/null; then
+    msg "libtopsec: LOADED"
+  else
+    msg "libtopsec: not loaded"
+  fi
+  msg "engine log: $RUN/engine.log"
+  local nf=0 f
+  for f in "$FWDIR"/*.cfg; do [ -e "$f" ] && nf=$((nf+1)); done
+  [ "$nf" -gt 0 ] && msg "forwards: $nf (see: topsap fwd ls)"
+  return 0
+}
+
+cmd_run(){
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+  local out rc=0
+  out=$(printf '%s\n' "$*" | socat -t "${TOPSAP_TIMEOUT:-120}" -,ignoreeof UNIX-CONNECT:"$CTL")
+  case "$out" in
+    *"@@rc="*)
+      rc=${out##*@@rc=}; rc=${rc//[^0-9]/}
+      out=${out%@@rc=*}; out=${out%$'\n'}
+      ;;
+  esac
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return "${rc:-0}"
+}
+
+# A tmux server inherits the network namespace of whoever started it, and tun0
+# exists in exactly one namespace: the sandbox's.  A window in a server started
+# from out here would ssh into nothing, so before creating any window check that
+# the server we are talking to really is the in-sandbox one.
+tmux_ns_ok(){
+  local spid ns
+  [ -S "$TMUX" ] || return 1
+  spid=$(tmux -S "$TMUX" display-message -p -t topsap '#{pid}' 2>/dev/null) || return 1
+  [ -n "$spid" ] || return 1
+  ns=$(readlink "/proc/$(pget "$RUN/ns.pid")/ns/net" 2>/dev/null) || return 1
+  [ -n "$ns" ] || return 1
+  [ "$(readlink "/proc/$spid/ns/net" 2>/dev/null)" = "$ns" ]
+}
+
+# This is the bug the user hit: the in-sandbox server had died, the old fallback
+# started a replacement right here, ssh had no route to the cluster, hung for the
+# kernel's ~130 s SYN timeout, exited 255, closed the only window -- which killed
+# the server and made tmux print "[exited]", erasing the error.  Never create a
+# server from this side; restart it through the control channel, which runs in
+# the sandbox.
+tmux_ensure(){
+  tmux_ns_ok && return 0
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+  msg "topsap: (re)starting the tmux server inside the sandbox"
+  # One line only: ctlsh.sh reads a single line and ignores the rest, so a
+  # multi-line command here would silently run just its first command.
+  cmd_run "tmux -S '$TMUX' kill-server 2>/dev/null; tmux -S '$TMUX' new-session -d -s topsap -n keeper 'sh -c \"while :; do sleep 3600; done\"'" >/dev/null
+  sleep 1
+  tmux_ns_ok || die "could not start a tmux server inside the sandbox"
+}
+
+# Create a window and print its id, which is how every caller must address it.
+# A window name cannot be used as a target once it repeats -- and it repeats by
+# design here, because the window is named after the host you asked for, so two
+# attempts at the same host give two windows called the same thing.  tmux then
+# answers an ambiguous name with "can't find window: HOST" rather than picking
+# one, which is what made the second 'topsap ssh HOST' fail whenever the first
+# window was still around (a failed ssh now stays open on purpose, so that is
+# easy to hit).  Ids are unique for the life of the server.
+tmux_new_window(){
+  tmux -S "$TMUX" new-window -d -P -F '#{window_id}' -t topsap -n "$1" "$2"
+}
+
+cmd_shell(){
+  tmux_ensure
+  local H=${TOPSAP_HOME:-$HOME}
+  # The session's first window is an idle keeper, so the shell the user asked for
+  # needs its own window.
+  local wid; wid=$(tmux_new_window shell "TOPSAP_IN_SANDBOX=1 HOME='$H' exec bash -i")
+  [ -n "$wid" ] || die "could not create a shell window inside the sandbox"
+  exec tmux -S "$TMUX" attach -t "$wid"
+}
+
+# Interactive ssh has to run on a real pty inside the namespaces, so give it a
+# tmux window rather than the socat control channel.
+cmd_ssh(){
+  tmux_ensure
+  local H=${TOPSAP_HOME:-$HOME}
+  # Drop anything that is not a plain name character rather than mapping it to
+  # '-': one stray byte (a CR picked up from a paste) otherwise produced a window
+  # called 'vpn-login-'.
+  local name=
+  [ $# -gt 0 ] && name=$(printf '%s' "$1" | tr -cd 'A-Za-z0-9_.-')
+  [ -n "$name" ] || name=ssh
+  local q; q=$(printf '%q ' "$@")
+  # Hold the window open when ssh fails: tmux throws a dead window's last screen
+  # away, and a reason on screen for zero seconds is how "hangs, then [exited],
+  # no error" happened.  A clean exit still closes the window as usual.
+  local line="TOPSAP_IN_SANDBOX=1 HOME='$H' $BIN/vpnssh.sh $q"
+  line="$line; rc=\$?; if [ \$rc -ne 0 ]; then echo; echo \"[vpnssh exited \$rc]\"; if [ -t 0 ]; then printf 'press Enter to close... '; read -r _; fi; fi"
+  local wid; wid=$(tmux_new_window "$name" "$line")
+  [ -n "$wid" ] || die "could not create a tmux window inside the sandbox"
+  exec tmux -S "$TMUX" attach -t "$wid"
+}
+
+# The sandbox's tmux server has its own socket, so the tmux you run normally in
+# your shell cannot see these windows; this lists them (and their ids, which is
+# what 'topsap ssh' attaches to).
+cmd_windows(){
+  tmux_ensure
+  tmux -S "$TMUX" list-windows -t topsap -F \
+    '#{window_index}: #{window_name}#{?window_active,*, } #{window_id} #{?pane_dead,[dead],#{pane_current_command}}'
+}
+
+cmd_log(){ tail -n "${1:-60}" "$RUN/engine.log" 2>/dev/null || cat "$RUN/sandbox.log"; }
+
+# Publish this machine's LAN proxy on the remote side.  The proxy's address is
+# dialled HERE, from inside the sandbox, so it must be the address as this
+# machine sees it.  The ssh config's remote block owns the port number
+# (RemoteForward 18438 ...); this just keeps such a connection alive in the
+# background.  The pid we record is the only process we will ever signal.
+cmd_proxy(){
+  local H=${TOPSAP_HOME:-$HOME}
+  local act=${1:-status}
+  local target=${TOPSAP_PROXY_TARGET:-}
+  local pidf=$RUN/proxy.pid logf=$RUN/proxy.log
+  [ -n "$target" ] || die "set TOPSAP_PROXY_TARGET to the ~/.ssh/config host that
+        carries 'RemoteForward $PXPORT ...' (see topsap.env.example)"
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+
+  case "$act" in
+    up)
+      if alive "$pidf"; then msg "proxy tunnel already up (pid $(pget "$pidf"))"; return 0; fi
+      rm -f "$pidf" "$logf"
+      cmd_run "HOME='$H' nohup ssh -N -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+        '$target' >'$logf' 2>&1 </dev/null & echo \$! >'$pidf'"
+      sleep 3
+      if alive "$pidf"; then
+        msg "proxy tunnel up (pid $(pget "$pidf")); remote $target now serves 127.0.0.1:$PXPORT"
+        return 0
+      fi
+      msg "proxy tunnel FAILED to stay up:"
+      [ -s "$logf" ] && tail -n 10 "$logf" | sed 's/^/  /'
+      rm -f "$pidf"
+      return 1
+      ;;
+    down)
+      local p; p=$(pget "$pidf")
+      if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        kill -TERM "$p" 2>/dev/null && msg "proxy tunnel stopped (pid $p)"
+        sleep 1
+        kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
+      else
+        msg "proxy tunnel not running"
+      fi
+      rm -f "$pidf"
+      ;;
+    status|*)
+      if alive "$pidf"; then
+        msg "proxy tunnel: up (pid $(pget "$pidf")) -> 127.0.0.1:$PXPORT on $target"
+      else
+        msg "proxy tunnel: down"
+        [ -s "$logf" ] && { msg "last log:"; tail -n 5 "$logf" | sed 's/^/  /'; }
+      fi
+      ;;
+  esac
+}
+
+# Ask the remote side what it sees.  The script is fed over stdin because it has
+# to run there, not here.
+cmd_pxcheck(){
+  local H=${TOPSAP_HOME:-$HOME}
+  local target=${TOPSAP_PROXY_TARGET:-}
+  [ -n "$target" ] || die "set TOPSAP_PROXY_TARGET (see topsap.env.example)"
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+  # The port travels as a prefix to the remote shell, so the script on the far
+  # side checks the same port this one publishes.
+  cmd_run "HOME='$H' ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ClearAllForwardings=yes \
+    '$target' 'PXPORT=$PXPORT bash -s' < '$STATE/pxcheck.sh'" | grep -vE 'Pseudo-terminal|Warning: Permanently added'
+}
+
+# Port forwards: make a port that exists only on the far side of the tunnel
+# reachable *here*.
+#
+# The listener has to be on this machine, because this machine is where you (and
+# anything else here) can reach it; the dial has to happen inside the sandbox,
+# because the sandbox is the only place with a route into the VPN subnets.  Those
+# are
+# two different network namespaces, and the sandbox's loopback is not this
+# loopback, so a listener created in there is invisible out here.  The one thing
+# that is a socket on both sides at once is the filesystem -- ~/topsap/run is
+# the same directory for both -- so the two halves are joined by a unix socket:
+#
+#   this machine                        inside the sandbox
+#   ------------                        ------------------
+#   socat TCP-LISTEN:LPORT  ->  run/fwd/LPORT.sock  ->  socat UNIX-LISTEN -> TCP DEST
+#
+# socat out here accepts the connection and hands the bytes to the socket file;
+# socat in there picks them up and dials the destination over tun0.  No ssh, no
+# key, no privileges, nothing on the host touched -- and the far side does not
+# need to run anything: only the port that is already listening there.
+FWDIR=$RUN/fwd
+
+fwd_pid(){ printf '%s/%s.%s.pid' "$FWDIR" "$1" "$2"; }
+
+fwd_dest(){ awk -F= '$1=="dest"{print $2}' "$FWDIR/$1.cfg" 2>/dev/null; }
+fwd_bind(){ local b; b=$(awk -F= '$1=="bind"{print $2}' "$FWDIR/$1.cfg" 2>/dev/null); printf '%s' "${b:-127.0.0.1}"; }
+fwd_mode(){ awk -F= '$1=="mode"{print $2}' "$FWDIR/$1.cfg" 2>/dev/null; }
+
+# Stop both halves.  Either may already be gone; that is not an error.
+fwd_stop(){
+  local n=$1 p
+  p=$(pget "$(fwd_pid "$n" host)")
+  # The outer half is started with setsid, so a single signal reaches the
+  # per-connection children it forked as well.
+  [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null
+  p=$(pget "$(fwd_pid "$n" guest)")
+  [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
+  rm -f "$(fwd_pid "$n" host)" "$(fwd_pid "$n" guest)" "$FWDIR/$n.cfg" "$FWDIR/$n.sock" "$FWDIR/$n.dial"
+  return 0
+}
+
+# Resolve a destination into:  HOST PORT MODE ALIAS
+#
+#   DEST is  [ALIAS:]HOST[:PORT]
+#     ALIAS  a name from ~/.ssh/config.  Its hostname and port are the defaults,
+#            so `vpn-login:22` is the same as its own HostName:Port -- but see below.
+#     HOST   an address to dial from inside the tunnel
+#     PORT   defaults to LPORT (the "same number" convenience)
+#
+# MODE is `direct` or `ssh`, and it is the one thing that is not a convenience:
+# a host whose config carries a ProxyCommand is *only* reachable through that
+# command.  `vpn-remote` is the example -- its HostName/Port are what the
+# ProxyCommand produces, so a direct dial to that address reaches the jump host's
+# own sshd, not the thing vpn-remote names.  For those, the dial is made from
+# inside an `ssh -W` connection instead, which runs the whole config chain.
+fwd_resolve(){
+  local spec=$1 lport=$2 f1= f2= f3= g gh pc
+  local dh= dp= alias= mode=direct
+
+  set -f                      # no globbing on the pieces
+  local IFS=:
+  set -- $spec
+  set +f
+  [ $# -le 3 ] || die "bad destination '$spec' (usage: topsap fwd LPORT [ALIAS:]HOST[:PORT] [BIND])"
+  f1=${1:-}; f2=${2:-}; f3=${3:-}
+
+  case "$f1" in
+    ""|*[!A-Za-z0-9._-]*) die "bad destination '$spec' (usage: topsap fwd LPORT [ALIAS:]HOST[:PORT] [BIND])";;
+  esac
+
+  case "$f1" in
+    *[!0-9.]*|"")                                  # a name, so ask ssh about it
+      g=$(ssh -G "$f1" 2>/dev/null) || g=
+      gh=$(printf '%s\n' "$g" | awk '$1=="hostname"{print $2; exit}')
+      pc=$(printf '%s\n' "$g" | awk '$1=="proxycommand"{$1="";sub(/^ /,"");print;exit}')
+      alias=$f1
+      case "$pc" in
+        # The name's own HostName is the thing to dial.
+        ""|none) mode=direct; [ -n "$gh" ] && dh=$gh;;
+        # Reached through the ProxyCommand.  With no other host named, the thing
+        # meant is a service on that node itself -- such a ProxyCommand dials a
+        # loopback port over there, and that is the shape of
+        # every such service -- so default to the far side's loopback, not to the
+        # address the ProxyCommand itself uses to get there.
+        *)       mode=ssh; dh=127.0.0.1;;
+      esac
+      ;;
+    *)                                             # an address: use it as-is
+      dh=$f1
+      ;;
+  esac
+
+  # second and third fields: with three, the middle one is the far-side host.
+  if [ -n "$f3" ]; then dh=${f2:-$dh}; dp=$f3
+  elif [ -n "$f2" ]; then dp=$f2
+  fi
+
+  # A bare address never went through ssh -G, so dh may still be unset.
+  [ -n "$dh" ] || dh=$f1
+  [ -n "$dp" ] || dp=$lport
+  printf '%s %s %s %s\n' "$dh" "$dp" "$mode" "$alias"
+}
+
+fwd_add(){
+  local lport=${1:-} dest=${2:-} bind=${3:-127.0.0.1}
+  local U="usage: topsap fwd LPORT [ALIAS:]HOST[:PORT] [BIND-ADDR]   e.g. topsap fwd 9000 10.0.0.4:8888"
+  case "$lport" in ""|*[!0-9]*) die "$U";; esac
+  [ -n "$dest" ] || die "$U"
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+
+  local r dh dp mode alias dial
+  r=$(fwd_resolve "$dest" "$lport")
+  dh=${r%% *}; r=${r#* }
+  dp=${r%% *}; r=${r#* }
+  mode=${r%% *}; alias=${r#* }
+  case "$dp" in *[!0-9]*) die "destination port must be a number (got '$dp')";; esac
+  [ -n "$dh" ] || die "no destination host in '$dest'"
+
+  # How the far-side half dials.
+  #
+  # The ssh case gets a wrapper script rather than an inline command, because
+  # socat's address parser splits its own address strings on whitespace and
+  # would hand ssh a torn `-W 127.0.0.1 2734` -- measured, not assumed:
+  #   socat -u SYSTEM:'... -W 127.0.0.1:2734 alias' -   ->  "there are 5 addresses"
+  # It is not worth living inside socat's quoting rules for that, and a file is
+  # easier to read when a forward misbehaves anyway.
+  local dial
+  case "$mode" in
+    ssh) dial="EXEC:$FWDIR/$lport.dial";;
+    *)   dial="TCP:'$dh:$dp'";;
+  esac
+
+  # If the port is taken here, socat fails and the only clue is its log.
+  if ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | grep -qE "[:.]$lport\$"; then
+    die "port $lport is already in use on this machine"
+  fi
+
+  mkdir -p "$FWDIR"
+  fwd_stop "$lport"     # clears any previous .cfg/.dial/.sock for this port
+  local sock=$FWDIR/$lport.sock glog=$FWDIR/$lport.guest.log hlog=$FWDIR/$lport.host.log
+  rm -f "$glog" "$hlog"
+
+  # Written after fwd_stop, which deletes a stale wrapper along with everything
+  # else this port owned.
+  case "$mode" in
+    ssh)
+      {
+        printf '#!/bin/sh\n'
+        printf '# written by topsap fwd for %s:%s -> %s:%s via %s\n' \
+               "$bind" "$lport" "$dh" "$dp" "$alias"
+        printf 'exec ssh -o IdentityAgent=none -o StrictHostKeyChecking=accept-new \\\n'
+        printf '         -o BatchMode=yes -o LogLevel=ERROR -W %s %s\n' "$dh:$dp" "$alias"
+      } > "$FWDIR/$lport.dial"
+      chmod 700 "$FWDIR/$lport.dial"
+      ;;
+  esac
+
+  # Inner half first: it owns the socket file, and the outer half has nothing to
+  # connect to until that exists.  One line only -- ctlsh.sh reads a single line.
+  cmd_run "nohup socat UNIX-LISTEN:'$sock',fork,mode=600 $dial >'$glog' 2>&1 </dev/null & echo \$! >'$(fwd_pid "$lport" guest)'" >/dev/null
+  local i
+  for i in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
+  if [ ! -S "$sock" ]; then
+    msg "the in-sandbox relay did not start:"
+    [ -s "$glog" ] && tail -n 5 "$glog" | sed 's/^/  /'
+    fwd_stop "$lport"; return 1
+  fi
+
+  setsid nohup socat TCP-LISTEN:"$lport",bind="$bind",fork,reuseaddr UNIX-CONNECT:"$sock" >"$hlog" 2>&1 </dev/null &
+  echo $! > "$(fwd_pid "$lport" host)"
+  printf 'bind=%s\ndest=%s:%s\nmode=%s\nalias=%s\n' "$bind" "$dh" "$dp" "$mode" "$alias" > "$FWDIR/$lport.cfg"
+  sleep 0.3
+
+  # One connection is the whole test, and it must be exactly one.  In ssh mode
+  # every connection through this forward logs in to the jump host, whose
+  # session limit is shared with whatever else is using the account -- so dial
+  # once and judge from that, instead of probing twice and paying twice.
+  local probe=$bind; [ "$probe" = 0.0.0.0 ] && probe=127.0.0.1
+  local got rc w; w=$(fwd_wait "$mode")
+  got=$(timeout $((w + 10)) bash -c '
+    exec 3<>/dev/tcp/'"$probe/$lport"' || exit 3
+    IFS= read -r -t '"$w"' l <&3 || exit 4
+    printf %s "$l"
+  ' 2>/dev/null); rc=$?
+
+  if [ "$rc" = 3 ]; then
+    msg "started, but nothing is listening on $probe:$lport"
+    [ -s "$hlog" ] && tail -n 5 "$hlog" | sed 's/^/  /'
+    fwd_stop "$lport"; return 1
+  fi
+
+  got=$(printf '%s' "$got" | tr -d '\r' | cut -c1-60)
+  msg "forwarded: $bind:$lport -> $dh:$dp  ($(fwd_how "$mode" "$alias"), relay pid $(pget "$(fwd_pid "$lport" host)"))"
+  if [ -n "$got" ]; then
+    msg "  the far side answered: $got"
+  elif [ "$rc" = 4 ]; then
+    # Silence is not failure and must not be dressed up as success either: an
+    # HTTP server waits to be spoken to, and this gateway black-holes an
+    # unroutable port rather than refusing it, so both look identical for a
+    # while.  Say what happened and hand over the way to find out.
+    msg "  the far side sent nothing in ${w}s -- normal for HTTP/HTTPS, but silence"
+    msg "  is also all an unroutable port looks like here; to tell them apart:"
+    msg "    topsap fwd check $lport"
+  fi
+
+  # The far-side log is evidence, never a verdict: in ssh mode it normally
+  # carries the jump host's login banner even when the forward is perfect.
+  if [ -s "$glog" ]; then
+    msg "  the far side logged:"
+    tail -n 3 "$glog" | sed 's/^/    /'
+  fi
+}
+
+# "direct" or "through the ssh alias", in words.
+fwd_how(){
+  case "$1" in
+    ssh) printf 'dialled through ssh %s' "$2";;
+    *)   printf 'dialled directly';;
+  esac
+}
+
+# How long to wait for the far side's first byte.  A direct forward is one TCP
+# dial; ssh mode pays for a nested login first -- measured at ~17 s from accept
+# to first byte on this path (ssh to the alias, its ProxyCommand logging in to
+# the jump host, ncat, then the far sshd) -- so a few seconds would be an unfair
+# window and would report a working forward as silence.
+fwd_wait(){
+  case "$1" in
+    ssh) printf 45;;
+    *)   printf 8;;
+  esac
+}
+
+# Prove a forward on demand: make a real connection and report what comes back,
+# plus the logs of both halves.
+fwd_check(){
+  local n=${1:-}
+  case "$n" in ""|*[!0-9]*) die "usage: topsap fwd check LPORT";; esac
+  [ -e "$FWDIR/$n.cfg" ] || die "no forward on port $n"
+  local b d sock pid got
+  b=$(fwd_bind "$n"); d=$(fwd_dest "$n"); sock=$FWDIR/$n.sock
+
+  pid=$(pget "$(fwd_pid "$n" host)")
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then msg "host half : up (pid $pid, listening $b:$n)"; else msg "host half : DOWN"; fi
+  pid=$(pget "$(fwd_pid "$n" guest)")
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then msg "far half  : up (pid $pid)"; else msg "far half  : DOWN"; fi
+  [ -S "$sock" ] && msg "relay     : $sock" || msg "relay     : MISSING ($sock)"
+
+  if [ -s "$FWDIR/$n.guest.log" ]; then
+    msg "far half says:"; tail -n 5 "$FWDIR/$n.guest.log" | sed 's/^/  /'
+  fi
+
+  # Make one real connection and report what came back.  Whatever the far half
+  # writes during it is shown as the delta, so a stale banner from an earlier
+  # connection is not mistaken for this one's result.
+  local before after got rc w; w=$(fwd_wait "$(fwd_mode "$n")")
+  before=$(wc -c < "$FWDIR/$n.guest.log" 2>/dev/null || echo 0)
+  got=$(timeout $((w + 10)) bash -c '
+    exec 3<>/dev/tcp/'"$b/$n"' || exit 3
+    IFS= read -r -t '"$w"' l <&3 || exit 4
+    printf %s "$l"
+  ' 2>/dev/null); rc=$?
+  after=$(wc -c < "$FWDIR/$n.guest.log" 2>/dev/null || echo 0)
+  got=$(printf '%s' "$got" | tr -d '\r' | cut -c1-60)
+
+  if [ "$rc" = 3 ]; then
+    msg "connection to $b:$n: refused -- nothing is listening here"
+    return 1
+  fi
+  if [ -n "$got" ]; then
+    msg "connection to $b:$n -> $d: the far side answered '$got'"
+  else
+    # A service that speaks second is indistinguishable from a destination that
+    # is not there, until one of them says so.
+    msg "connection to $b:$n -> $d: connected, but the far side sent nothing in ${w}s"
+    msg "  (normal for anything that waits to be spoken to -- curl or ssh it and"
+    msg "   the bytes go through)"
+  fi
+  if [ "$after" != "$before" ]; then
+    msg "and the far side logged:"
+    tail -c "+$((before + 1))" "$FWDIR/$n.guest.log" | tail -n 5 | sed 's/^/  /'
+  fi
+  [ "$rc" != 3 ]
+}
+
+fwd_rm(){
+  local n=${1:-}
+  [ -n "$n" ] || die "usage: topsap fwd rm LPORT|all"
+  if [ "$n" = all ]; then
+    local f; for f in "$FWDIR"/*.cfg; do [ -e "$f" ] && fwd_stop "$(basename "$f" .cfg)"; done
+    msg "all forwards stopped"; return 0
+  fi
+  case "$n" in *[!0-9]*) die "usage: topsap fwd rm LPORT|all";; esac
+  [ -e "$FWDIR/$n.cfg" ] || { msg "no forward on port $n"; return 0; }
+  fwd_stop "$n"; msg "forward on port $n stopped"
+}
+
+fwd_ls(){
+  local any= f n p d b st
+  for f in "$FWDIR"/*.cfg; do
+    [ -e "$f" ] || continue
+    any=1
+    n=$(basename "$f" .cfg); d=$(fwd_dest "$n"); b=$(fwd_bind "$n")
+    p=$(pget "$(fwd_pid "$n" host)")
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then st="up, pid $p"; else st="DOWN"; fi
+    printf '%s:%s -> %s   [%s, %s]\n' "$b" "$n" "$d" "$st" "$(fwd_how "$(fwd_mode "$n")" "$(awk -F= '$1=="alias"{print $2}' "$FWDIR/$n.cfg" 2>/dev/null)")"
+  done
+  [ -n "$any" ] || msg "no forwards (make one: topsap fwd 9000 10.0.0.4:8888)"
+}
+
+cmd_fwd(){
+  case "${1:-}" in
+    ""|ls|list)   fwd_ls;;
+    add|up)       shift; fwd_add "$@";;
+    check|test)   shift; fwd_check "$@";;
+    rm|down|del)  shift; fwd_rm "$@";;
+    *)            fwd_add "$@";;      # topsap fwd 9000 10.0.0.4:8888
+  esac
+}
+
+cmd_probe(){
+  cmd_run 'echo "--- egress ip ---"; curl -s -o /dev/null -w "%{http_code}\n" --max-time 8 http://1.1.1.1 || echo fail
+echo "--- dns ---"; getent hosts github.com || echo "dns fail"
+echo "--- https by name ---"; curl -s -o /dev/null -w "%{http_code}\n" --max-time 8 https://github.com || echo fail
+echo "--- links ---"; ip -br link
+echo "--- engine port ---"; ss -ltn 2>/dev/null | grep -E "7443|7411" || echo "no local listener"'
+}
+
+cmd_login(){
+  [ $# -ge 3 ] || die "usage: topsap login HOST PORT USER [PWD]  (or set TOPSAP_PWD)"
+  local host=$1 port=$2 user=$3 pwd=${4:-${TOPSAP_PWD:-}}
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+  if [ -z "$pwd" ]; then
+    if [ -t 0 ]; then printf 'password for %s@%s:%s: ' "$user" "$host" "$port" >&2; read -rs pwd; echo >&2
+    else die "no password (4th arg or TOPSAP_PWD)"; fi
+  fi
+  printf '%s' "$pwd" | python3 "$BIN/svmk.py" login "$host" "$port" "$user" - >"$RUN/req.json" || die "failed to build request"
+  chmod 600 "$RUN/req.json"
+  local rc; cmd_run "svctl @$RUN/req.json"; rc=$?
+  rm -f "$RUN/req.json"
+  return $rc
+}
+
+cmd_vpn(){ cmd_run "svctl @/dev/stdin"; }
+
+cmd_simple(){
+  local m=$1; shift
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+  python3 "$BIN/svmk.py" "$m" "$@" >"$RUN/req.json" || die "bad request"
+  chmod 600 "$RUN/req.json"
+  cmd_run "svctl @$RUN/req.json"
+  rm -f "$RUN/req.json"
+}
+
+case "${1:-}" in
+  up)     shift; cmd_up "$@";;
+  down)   shift; cmd_down "$@";;
+  status) shift; cmd_status "$@";;
+  vpn|query)  shift; cmd_simple query_status;;
+  logout)     shift; cmd_simple logout;;
+  raw)        shift; cmd_simple raw "$@";;
+  login)      shift; cmd_login "$@";;
+  proxy)      shift; cmd_proxy "$@";;
+  pxcheck)    shift; cmd_pxcheck "$@";;
+  fwd|forward|port) shift; cmd_fwd "$@";;
+  shell)  shift; cmd_shell "$@";;
+  ssh)    shift; cmd_ssh "$@";;
+  windows|win) shift; cmd_windows "$@";;
+  run|exec) shift; cmd_run "$@";;
+  probe)  shift; cmd_probe "$@";;
+  log)    shift; cmd_log "$@";;
+  ""|-h|--help|help) usage;;
+  *) usage; exit 1;;
+esac
