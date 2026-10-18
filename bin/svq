@@ -1,0 +1,17 @@
+#!/bin/sh
+# svq <method> [key=value ...]   |   svq '<raw json>'
+SV=${TOPSAP_ROOT:-$HOME/topsap}/bin/svctl
+case "$1" in
+  \{*) exec "$SV" "$1";;
+esac
+m=$1; shift
+json="{\"method\": \"$m\""
+for kv in "$@"; do
+  k=${kv%%=*}; v=${kv#*=}
+  case "$v" in
+    true|false|[0-9]*) json="$json, \"$k\": $v";;
+    *) json="$json, \"$k\": \"$v\"";;
+  esac
+done
+json="$json}"
+exec "$SV" "$json"
