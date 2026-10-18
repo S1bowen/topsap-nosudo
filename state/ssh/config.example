@@ -1,0 +1,44 @@
+# ~/.ssh/config fragment for topsap -- EXAMPLE ONLY.
+#
+# Rename the aliases below to whatever you like, then name them in
+# ~/topsap/topsap.env (see topsap.env.example):
+#
+#   TOPSAP_TARGET=10.0.0.4          # optional: address probed after login
+#   TOPSAP_TEST_HOST=vpn-login      # optional: ssh alias tested after login
+#   TOPSAP_PROXY_TARGET=vpn-remote  # alias that carries the RemoteForward
+#   TOPSAP_PROXY_PORT=18438         # must equal RemoteForward's first argument
+#
+# `topsap up` does not read this file.  It matters for `topsap ssh`,
+# `topsap run 'ssh ...'`, and `topsap proxy`: the engine runs inside a private
+# mount/net namespace, but it re-binds your real $HOME, so OpenSSH inside the
+# sandbox resolves this file and your agent exactly as it does outside.
+#
+# The engine re-enters ~/.ssh as root-in-namespace with HOME set to your real
+# home, which is why no `User`/`IdentityFile` path rewriting is needed here.
+
+Host vpn-login
+  HostName 10.0.0.4
+  User your-vpn-account
+  ServerAliveInterval 60
+  ServerAliveCountMax 3
+  RequestTTY yes
+  ForwardAgent yes
+  # IdentityFile ~/.ssh/id_ed25519
+
+# A second hop: reachable only from the login host, via a tool that already
+# exists there.  Replace the ncat path with whatever your site provides.
+Host vpn-remote
+  HostName 10.0.0.4
+  User your-vpn-account
+  ProxyCommand ssh vpn-login /path/on/the/far/side/bin/ncat 127.0.0.1 2734
+  HostKeyAlias vpn-remote
+  ServerAliveInterval 60
+  ServerAliveCountMax 3
+  ForwardAgent yes
+  # IdentityFile ~/.ssh/id_ed25519
+
+  # `topsap proxy up` keeps one of these connections open and publishes the
+  # HTTP proxy running on THIS machine as 127.0.0.1:18438 on the far side.
+  # The first number must equal TOPSAP_PROXY_PORT; the right-hand side is the
+  # proxy address as seen from this machine.
+  RemoteForward 18438 127.0.0.1:7897
