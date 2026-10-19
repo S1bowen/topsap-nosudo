@@ -149,6 +149,24 @@ def build_login(host, port, user, pwd, auth=None):
     return req
 
 
+def build_kick(host, port, user, pwd, auth=None):
+    """Drop the account's other sessions and adopt the one the gateway returns.
+
+    The GUI offers this when a login reports -40077 (multiple logins not
+    allowed) and then calls get_config_info on the returned session_id without
+    asking for another 2FA code.  Sending it when no other session exists is
+    harmless: the gateway answers with the current session or an error.
+    """
+    req = {
+        "method": "kick_user",
+        "vone": {"addr": str(host), "port": str(port),
+                 "user": user_field(user), "pwd": pwd_field(pwd)},
+        "proxy": _proxy_block(None),
+    }
+    req.update(_auth_block(auth))
+    return req
+
+
 def build_chk_sms(code, auth=None, flag="otp"):
     """Second-factor submission.
 
@@ -215,6 +233,10 @@ def main():
         if len(a) < 4:
             die("usage: svmk.py login HOST PORT USER [AUTHPARAM_JSON|-]   (password on stdin)")
         req = build_login(a[1], a[2], a[3], _pwd_from_stdin(), _load_auth(a[4] if len(a) > 4 else None))
+    elif m == "kick":
+        if len(a) < 4:
+            die("usage: svmk.py kick HOST PORT USER [AUTHPARAM_JSON|-]   (password on stdin)")
+        req = build_kick(a[1], a[2], a[3], _pwd_from_stdin(), _load_auth(a[4] if len(a) > 4 else None))
     elif m == "otp":
         if len(a) < 2:
             die("usage: svmk.py otp CODE [AUTHPARAM_JSON|-]   (google-authenticator code)")

@@ -135,34 +135,90 @@ send "query_status" run/qs.json qs
 
 say ""
 say "=== tunnel ==="
-TSTATE=$(python3 - <<'PY'
+# query_statistics is what the shipped client polls after login (sv_init.js
+# checkNaStatus: tstate_id 6 or 16 means up, once per second).  query_status
+# reports tstate_id 0 on this gateway even while the tunnel is established, so
+# it is not used for the verdict here.
+# Keep the request in its own file: svctl reads the request from @FILE and the
+# reply is extracted into run/stats.json, so reusing one path would make the
+# second poll send the previous reply back to the engine.
+python3 bin/svmk.py raw '{"method":"query_statistics"}' > run/stats.req.json
+TS=
+for i in $(seq 1 20); do
+  bin/topsap run "svctl @$ROOT/run/stats.req.json" > run/stats.raw 2>&1
+  extract run/stats.raw run/stats.json
+  TS=$(python3 - <<'PY'
 import json
 try:
-    d = json.load(open('run/qs.json'))
+    print(json.load(open('run/stats.json')).get('tstate_id'))
 except Exception:
-    raise SystemExit
-print('%s %s %s %s' % (d.get('tstate_id'), d.get('vip'), d.get('vip_mask'), d.get('state_id')))
+    print('')
 PY
 )
-case "$TSTATE" in
-  "6 "*) say "  tstate_id=6 - tunnel ESTABLISHED  ($TSTATE)";;
-  *)     say "  tunnel not up  (tstate_id vip mask state_id = $TSTATE)"
-         say "  --- engine log tail ---"
-         tail -n 20 run/engine.log | sed 's/^/  /';;
+  case "$TS" in 6|16) break;; esac
+  sleep 1
+done
+python3 - run/stats.json <<'PY'
+import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+for k in ('tstate_id', 'terr_code', 'vip', 'vip_mask', 'tunnel_duration',
+          'send_bytes', 'recv_bytes'):
+    if k in d:
+        print('  %-16s %r' % (k, d[k]))
+PY
+case "$TS" in
+  6|16) say "  -> tunnel ESTABLISHED (tstate_id=$TS)";;
+  *)    say "  -> tunnel NOT established (tstate_id=${TS:-unknown})"
+        say "  --- engine log tail ---"
+        tail -n 20 run/engine.log | sed 's/^/  /';;
 esac
-bin/topsap run 'ip -br addr 2>/dev/null | sed "s/^/  /"' 2>/dev/null
-bin/topsap run 'ip route 2>/dev/null | sed "s/^/  /"' 2>/dev/null
+
+# The engine creates tun0 and adds the ACL routes; make sure the assigned vip is
+# actually on the interface before probing, because without a source address the
+# kernel will not put any packet on tun0 at all.  Adding it here only touches
+# the private network namespace, so it needs no privilege.
+VIP=$(python3 - <<'PY'
+import json
+try:
+    print(json.load(open('run/stats.json')).get('vip') or '')
+except Exception:
+    print('')
+PY
+)
+case "$VIP" in
+  ''|0.0.0.0) :;;
+  *) if bin/topsap run "ip -4 -o addr show dev tun0 2>/dev/null | grep -qw '$VIP'"; then
+       say "  tun0 carries $VIP"
+     elif bin/topsap run "ip link show tun0" >/dev/null 2>&1; then
+       say "  tun0 does NOT carry $VIP - adding it (inside the private netns)"
+       bin/topsap run "ip addr add $VIP/32 dev tun0" 2>&1 | sed 's/^/  /'
+     fi;;
+esac
+{ bin/topsap run 'ip -br addr show tun0 2>/dev/null; ip route 2>/dev/null'; } 2>/dev/null | sed 's/^/  /'
+
+tunrx(){ bin/topsap run 'cat /sys/class/net/tun0/statistics/rx_bytes 2>/dev/null' 2>/dev/null | tr -dc '0-9'; }
 
 if [ -n "$TARGET" ]; then
+  # TOPSAP_TARGET is host or host:port.  Split it: when a port is given, probe
+  # exactly that one; otherwise try ssh and telnet.
+  PROBE_HOST=${TARGET%:*}
+  PROBE_PORTS=${TARGET##*:}
+  [ "$PROBE_HOST" = "$TARGET" ] && PROBE_PORTS="22 23"
   say ""
-  say "=== reachability: $TARGET ==="
-  bin/topsap run "for p in 22 23; do if timeout 8 bash -c \"exec 3<>/dev/tcp/$TARGET/\$p\" 2>/dev/null; then echo \"  $TARGET:\$p OPEN\"; else echo \"  $TARGET:\$p closed\"; fi; done" 2>/dev/null
+  say "=== reachability: $PROBE_HOST (port(s): $PROBE_PORTS) ==="
+  R0=$(tunrx)
+  bin/topsap run "for p in $PROBE_PORTS; do if timeout 8 bash -c \"exec 3<>/dev/tcp/$PROBE_HOST/\$p\" 2>/dev/null; then echo \"  $PROBE_HOST:\$p OPEN\"; else echo \"  $PROBE_HOST:\$p closed or filtered\"; fi; done" 2>/dev/null
+  R1=$(tunrx)
+  say "  tun0 rx_bytes: ${R0:-?} -> ${R1:-?}  (unchanged: nothing came back on tun0)"
 fi
 
 if [ -n "$TEST_HOST" ]; then
   say ""
   say "=== ssh test: $TEST_HOST ==="
-  bin/topsap run "HOME='$HOME' ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new '$TEST_HOST' 'hostname; id -un'" 2>&1 \
+  bin/topsap run "HOME='$HOME' ssh -o BatchMode=yes -o ConnectTimeout=60 -o StrictHostKeyChecking=accept-new '$TEST_HOST' 'hostname; id -un'" 2>&1 \
     | grep -vE 'Pseudo-terminal|Warning: Permanently added' | sed 's/^/  /'
 fi
 

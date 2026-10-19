@@ -27,6 +27,9 @@ topsap - zero-privilege TopSAP SSL-VPN client
   topsap run CMD       run one command inside the tunnel
   topsap login H P U   log in to the VPN gateway (password: 4th arg / TOPSAP_PWD / prompt)
   topsap vpn           query tunnel status
+  topsap kick H P U    reset the account's sessions and bind a new one; the
+                       current tunnel goes down (multi-login recovery;
+                       password: 4th arg / TOPSAP_PWD / prompt)
   topsap proxy [up|down|status]
                        hold this machine's LAN proxy open on the remote side,
                        as 127.0.0.1:18438 on the TOPSAP_PROXY_TARGET alias
@@ -623,6 +626,23 @@ cmd_login(){
   return $rc
 }
 
+cmd_kick(){
+  [ $# -ge 3 ] || die "usage: topsap kick HOST PORT USER [PWD]  (or set TOPSAP_PWD)"
+  local host=$1 port=$2 user=$3 pwd=${4:-${TOPSAP_PWD:-}} auth=-
+  [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
+  if [ -z "$pwd" ]; then
+    if [ -t 0 ]; then printf 'password for %s@%s:%s: ' "$user" "$host" "$port" >&2; read -rs pwd; echo >&2
+    else die "no password (4th arg or TOPSAP_PWD)"; fi
+  fi
+  [ -s "$RUN/auth.json" ] && auth=$RUN/auth.json
+  printf '%s' "$pwd" | python3 "$BIN/svmk.py" kick "$host" "$port" "$user" "$auth" >"$RUN/req.json" \
+    || die "failed to build request"
+  chmod 600 "$RUN/req.json"
+  local rc; cmd_run "svctl @$RUN/req.json"; rc=$?
+  rm -f "$RUN/req.json"
+  return $rc
+}
+
 cmd_vpn(){ cmd_run "svctl @/dev/stdin"; }
 
 cmd_simple(){
@@ -642,6 +662,7 @@ case "${1:-}" in
   logout)     shift; cmd_simple logout;;
   raw)        shift; cmd_simple raw "$@";;
   login)      shift; cmd_login "$@";;
+  kick)       shift; cmd_kick "$@";;
   proxy)      shift; cmd_proxy "$@";;
   pxcheck)    shift; cmd_pxcheck "$@";;
   fwd|forward|port) shift; cmd_fwd "$@";;

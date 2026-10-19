@@ -21,8 +21,12 @@ SSH_OPTS=(
   -o StrictHostKeyChecking=accept-new   # tunnel hosts are not in known_hosts yet
   -o ServerAliveInterval=60
   # Bound the wait.  Unbounded, an unreachable host leaves ssh sitting on the
-  # kernel's TCP handshake for ~130 s before it says anything at all.
-  -o ConnectTimeout="${TOPSAP_CONNECT_TIMEOUT:-30}"
+  # kernel's TCP handshake for ~130 s before it says anything at all.  Do not
+  # make this tight: a host reached through a ProxyCommand pays the inner
+  # session's own authentication, which on a busy login node can take ~16 s
+  # before the first banner byte arrives, and ssh reports that as
+  # "Connection timed out during banner exchange".
+  -o ConnectTimeout="${TOPSAP_CONNECT_TIMEOUT:-60}"
 )
 
 if [ "${TOPSAP_IN_SANDBOX:-0}" = 1 ]; then
