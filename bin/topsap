@@ -226,26 +226,50 @@ cmd_proxy(){
   local H=${TOPSAP_HOME:-$HOME}
   local act=${1:-status}
   local target=${TOPSAP_PROXY_TARGET:-}
-  local pidf=$RUN/proxy.pid logf=$RUN/proxy.log
+  local pidf=$RUN/proxy.pid logf=$RUN/proxy.log tgtf=$RUN/proxy.target
   [ -n "$target" ] || die "set TOPSAP_PROXY_TARGET to the ~/.ssh/config host that
         carries 'RemoteForward $PXPORT ...' (see topsap.env.example)"
   [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
 
+  # Report what the running tunnel actually targets, not whatever the
+  # environment happens to say when 'status' is called.
+  running_target(){ cat "$tgtf" 2>/dev/null || true; }
+
   case "$act" in
     up)
-      if alive "$pidf"; then msg "proxy tunnel already up (pid $(pget "$pidf"))"; return 0; fi
+      if alive "$pidf"; then
+        msg "proxy tunnel already up (pid $(pget "$pidf")) -> 127.0.0.1:$PXPORT on $(running_target)"
+        return 0
+      fi
+      # The port is published by a RemoteForward on the target alias.  Point at
+      # an alias that has none (the login host instead of the host carrying the
+      # forward is the easy slip) and ssh connects fine, publishes nothing, and
+      # the far side only says "connection refused".  Refuse that up front.
+      if ! HOME="$H" ssh -G "$target" 2>/dev/null | grep -q "^remoteforward $PXPORT "; then
+        die "$target has no 'RemoteForward $PXPORT ...' in the ssh config:
+        ssh -G $target | grep -i remoteforward"
+      fi
       rm -f "$pidf" "$logf"
-      cmd_run "HOME='$H' nohup ssh -N -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+      printf '%s\n' "$target" > "$tgtf"
+      cmd_run "HOME='$H' nohup ssh -v -N -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
         -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
         '$target' >'$logf' 2>&1 </dev/null & echo \$! >'$pidf'"
-      sleep 3
-      if alive "$pidf"; then
+      # Authentication on a busy login node takes ~17 s, and ExitOnForwardFailure
+      # only fires after it.  Checking the pid after 3 s called that "up" before
+      # the forward existed; wait for the first authenticated line instead.
+      local i=0
+      while [ $i -lt 60 ] && alive "$pidf"; do
+        grep -q 'Authenticated to' "$logf" 2>/dev/null && break
+        sleep 1; i=$((i+1))
+      done
+      sleep 1
+      if alive "$pidf" && grep -q 'Authenticated to' "$logf" 2>/dev/null; then
         msg "proxy tunnel up (pid $(pget "$pidf")); remote $target now serves 127.0.0.1:$PXPORT"
         return 0
       fi
       msg "proxy tunnel FAILED to stay up:"
       [ -s "$logf" ] && tail -n 10 "$logf" | sed 's/^/  /'
-      rm -f "$pidf"
+      rm -f "$pidf" "$tgtf"
       return 1
       ;;
     down)
@@ -257,11 +281,11 @@ cmd_proxy(){
       else
         msg "proxy tunnel not running"
       fi
-      rm -f "$pidf"
+      rm -f "$pidf" "$tgtf"
       ;;
     status|*)
       if alive "$pidf"; then
-        msg "proxy tunnel: up (pid $(pget "$pidf")) -> 127.0.0.1:$PXPORT on $target"
+        msg "proxy tunnel: up (pid $(pget "$pidf")) -> 127.0.0.1:$PXPORT on $(running_target)"
       else
         msg "proxy tunnel: down"
         [ -s "$logf" ] && { msg "last log:"; tail -n 5 "$logf" | sed 's/^/  /'; }
