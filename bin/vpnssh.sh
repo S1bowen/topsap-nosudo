@@ -32,6 +32,11 @@ SSH_OPTS=(
 if [ "${TOPSAP_IN_SANDBOX:-0}" = 1 ]; then
   # Already inside the namespaces: this is the real call.
   #
+  # The sandbox needs its private /etc/passwd for ssh to find ~/.ssh/config.
+  # That bind can vanish from a live namespace, so repair it before asking ssh
+  # anything -- otherwise every alias below is treated as a DNS name.
+  command -v assert-mounts.sh >/dev/null 2>&1 && assert-mounts.sh
+
   # Preflight.  The sandbox can be perfectly healthy while the route into the
   # cluster is not -- the gateway dropped the session, or the tunnel never came
   # up.  Saying so here takes a second and names the fix; without it the only
@@ -42,6 +47,17 @@ if [ "${TOPSAP_IN_SANDBOX:-0}" = 1 ]; then
   if [ -n "$h" ] && [ -n "$p" ] && ! timeout 8 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null; then
     {
       echo "vpnssh: cannot reach $h:$p from inside the tunnel."
+      case "$h" in
+        *[!0-9.]*)
+          # An alias left unresolved means ssh never read the config; its
+          # DNS failure would otherwise be reported as a routing problem.
+          if ! getent hosts "$h" >/dev/null 2>&1; then
+            echo "        '$h' does not resolve, so ssh never read ~/.ssh/config:"
+            echo "        the sandbox lost its /etc/passwd mapping again."
+            echo "        fix   :  ~/topsap/bin/topsap run 'mount --bind $ROOT/run/etc/passwd /etc/passwd'"
+          fi
+          ;;
+      esac
       echo "        The sandbox is up, so either this address is not routed through"
       echo "        the VPN or the tunnel has gone away (it needs a live login)."
       echo "        check :  ~/topsap/bin/topsap vpn          # tunnel state"

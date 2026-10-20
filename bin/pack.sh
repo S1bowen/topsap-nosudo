@@ -51,8 +51,9 @@ chmod 600 "$STAGE/topsap/.pwd" 2>/dev/null || true
 # perfectly good 0700).  A tarball built from such a tree installs cleanly and
 # then fails with `Permission denied` the first time anyone runs the driver, so
 # set these here instead of inheriting them.
-for f in topsap sandbox.sh vpnup.sh vpnssh.sh ctlsh.sh pack.sh twofa.sh \
-         wrap.sh svjson.py svmk.py svctl svq svdbg sudo slirp4netns; do
+for f in topsap sandbox.sh vpnup.sh vpnssh.sh ctlsh.sh assert-mounts.sh \
+         pack.sh twofa.sh wrap.sh svjson.py svmk.py svctl svq svdbg sudo \
+         slirp4netns; do
   [ -e "$STAGE/topsap/bin/$f" ] || continue
   chmod 700 "$STAGE/topsap/bin/$f"
 done

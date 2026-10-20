@@ -188,6 +188,13 @@ Two things to watch:
   route exists. Raise the preflight timeout with `TOPSAP_CONNECT_TIMEOUT`.
 * **`fwd` says the far side sent nothing** — the service speaks second (like
   ssh). That is not a failure. `topsap fwd check N` tells the two apart.
+* **`vpnssh: cannot reach <alias>:22 ...`** where `<alias>` is the name you
+  typed — ssh never read `~/.ssh/config`, so the alias went to DNS. The sandbox
+  binds a generated `/etc/passwd` that points uid 0 at your real home (OpenSSH
+  finds `~/.ssh/config` through `getpwuid`, not `$HOME`), and that bind can
+  disappear from a live namespace. `bin/assert-mounts.sh` re-creates it on every
+  `topsap run` / `topsap ssh`, so this repairs itself; the message says so if the
+  generated copy is gone too.
 * **`bind /etc/hosts FAILED` / `cat: /etc/redhat-release: No such file`** —
   cosmetic; the vendor library probes for RHEL and the host is not RHEL.
 
@@ -202,6 +209,7 @@ More detail, including why each namespace and mount is needed, is in
 | `bin/sandbox.sh` | runs *inside* the namespaces; sysfs, `/etc`, engine, tmux |
 | `bin/vpnup.sh` | one-shot login (password + TOTP) |
 | `bin/vpnssh.sh` | ssh entry point that re-enters the namespace with the real `HOME` |
+| `bin/assert-mounts.sh` | re-asserts the sandbox's `/etc/passwd` mapping on each entry |
 | `bin/svmk.py` | builds the engine's request JSON (credential encoding, RSA) |
 | `bin/svjson.py` | repairs the engine's bare-key replies into strict JSON |
 | `src/svctl.c` | SHM client for the engine's control channel |
