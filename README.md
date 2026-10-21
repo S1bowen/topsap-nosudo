@@ -161,8 +161,12 @@ curl https://example.com
 and prints what it sees. The right-hand address is the proxy **as this machine
 sees it**, because it is dialled from inside the sandbox.
 
-Set `TOPSAP_PROXY_TARGET` to the alias that carries the `RemoteForward` and
-`TOPSAP_PROXY_PORT` to its first argument (default `18438`).
+The host carrying the `RemoteForward` is found automatically by asking `ssh -G`
+about each `Host` in `~/.ssh/config`; set `TOPSAP_PROXY_TARGET` only to override
+that, and `TOPSAP_PROXY_PORT` if the forward does not use the default `18438`.
+
+`topsap proxy status` and `topsap proxy down` need neither variable: they act
+on the pid and target the running tunnel recorded.
 
 Two things to watch:
 

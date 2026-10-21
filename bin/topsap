@@ -32,7 +32,8 @@ topsap - zero-privilege TopSAP SSL-VPN client
                        password: 4th arg / TOPSAP_PWD / prompt)
   topsap proxy [up|down|status]
                        hold this machine's LAN proxy open on the remote side,
-                       as 127.0.0.1:18438 on the TOPSAP_PROXY_TARGET alias
+                       as 127.0.0.1:18438 on the ssh host whose config has
+                       'RemoteForward 18438 ...' (TOPSAP_PROXY_TARGET overrides)
   topsap pxcheck       check that proxy from the remote side
   topsap fwd LPORT [ALIAS:]HOST[:PORT] [BIND]
                        bring a far-side port to THIS machine, e.g.
@@ -217,6 +218,22 @@ cmd_windows(){
 
 cmd_log(){ tail -n "${1:-60}" "$RUN/engine.log" 2>/dev/null || cat "$RUN/sandbox.log"; }
 
+# The ssh config owns the forward, so the host carrying 'RemoteForward 18438'
+# can be found instead of configured.  ssh -G is the judge -- using it rather
+# than parsing the file means Include and Match blocks behave exactly as they
+# do for ssh itself.  Wildcard Host patterns are skipped: ssh -G on them would
+# describe the pattern, not a real host.
+detect_proxy_target(){
+  local H=$1 f=$1/.ssh/config a
+  [ -r "$f" ] || return 1
+  while read -r a; do
+    case "$a" in ''|*[\*\?]*) continue;; esac
+    HOME="$H" ssh -G "$a" 2>/dev/null | grep -q "^remoteforward $PXPORT " || continue
+    printf '%s\n' "$a"; return 0
+  done < <(awk 'tolower($1)=="host" {for(i=2;i<=NF;i++) if($i !~ /^!/) {print $i; break}}' "$f")
+  return 1
+}
+
 # Publish this machine's LAN proxy on the remote side.  The proxy's address is
 # dialled HERE, from inside the sandbox, so it must be the address as this
 # machine sees it.  The ssh config's remote block owns the port number
@@ -227,8 +244,6 @@ cmd_proxy(){
   local act=${1:-status}
   local target=${TOPSAP_PROXY_TARGET:-}
   local pidf=$RUN/proxy.pid logf=$RUN/proxy.log tgtf=$RUN/proxy.target
-  [ -n "$target" ] || die "set TOPSAP_PROXY_TARGET to the ~/.ssh/config host that
-        carries 'RemoteForward $PXPORT ...' (see topsap.env.example)"
   [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
 
   # Report what the running tunnel actually targets, not whatever the
@@ -240,6 +255,19 @@ cmd_proxy(){
       if alive "$pidf"; then
         msg "proxy tunnel already up (pid $(pget "$pidf")) -> 127.0.0.1:$PXPORT on $(running_target)"
         return 0
+      fi
+      # A dead VPN session looks exactly like a working one until ssh sits on
+      # the handshake for a minute.  tun0 exists only inside the sandbox and
+      # only while the tunnel is up, so use it as the cheap precondition.
+      if ! cmd_run "ip -4 -o addr show tun0 2>/dev/null | grep -q 'inet '" >/dev/null; then
+        die "the tunnel is down (no tun0 in the sandbox), so there is nothing to
+        publish through.  Log in first:  $BIN/vpnup.sh"
+      fi
+      if [ -z "$target" ]; then
+        target=$(detect_proxy_target "$H") || die "no host in $H/.ssh/config carries
+        'RemoteForward $PXPORT ...'.  Add one there, or name it explicitly:
+          TOPSAP_PROXY_TARGET=<alias> topsap proxy up"
+        msg "TOPSAP_PROXY_TARGET unset; using '$target' (it carries RemoteForward $PXPORT)"
       fi
       # The port is published by a RemoteForward on the target alias.  Point at
       # an alias that has none (the login host instead of the host carrying the
@@ -299,7 +327,10 @@ cmd_proxy(){
 cmd_pxcheck(){
   local H=${TOPSAP_HOME:-$HOME}
   local target=${TOPSAP_PROXY_TARGET:-}
-  [ -n "$target" ] || die "set TOPSAP_PROXY_TARGET (see topsap.env.example)"
+  [ -n "$target" ] || target=$(cat "$RUN/proxy.target" 2>/dev/null || true)
+  [ -n "$target" ] || target=$(detect_proxy_target "$H" || true)
+  [ -n "$target" ] || die "no ~/.ssh/config host carries 'RemoteForward $PXPORT ...';
+        add one, or set TOPSAP_PROXY_TARGET (see topsap.env.example)"
   [ -S "$CTL" ] || die "sandbox not up (run: topsap up)"
   # The port travels as a prefix to the remote shell, so the script on the far
   # side checks the same port this one publishes.
